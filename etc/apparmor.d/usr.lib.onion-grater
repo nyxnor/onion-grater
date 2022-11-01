@@ -18,7 +18,7 @@
   #include <abstractions/python>
 
   ## This script doesn't really need to read the interpreter that's running it.
-  deny /usr/bin/python{2,3}.[0-7]* r,
+  deny /usr/bin/python{2,3}.[0-9]* r,
 
   ## Not needed.
   deny /etc/ssl/openssl.cnf r,
@@ -33,6 +33,12 @@
 
   /etc/onion-grater.d/ r,
   /etc/onion-grater.d/* r,
+  /etc/onion-grater-merger.d/ r,
+  /etc/onion-grater-merger.d/* r,
+  /usr/local/etc/onion-grater-merger.d/ r,
+  /usr/local/etc/onion-grater-merger.d/* r,
+  /usr/share/doc/onion-grater-merger/examples/ r,
+  /usr/share/doc/onion-grater-merger/examples/* r,
 
   /run/tor/control.authcookie r,
   /run/tor/control rw,

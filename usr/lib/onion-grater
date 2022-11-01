@@ -38,6 +38,7 @@
 #           event_option: event_option_value
 #           ...
 #         ...
+#       restrict-stream-events: true
 #
 # `name` (optional) is a string which gives an internal name, useful
 # for debugging. When not given, filters will default to the name of
@@ -119,9 +120,7 @@
 #
 # `restrict-stream-events` (optional) is a boolean, and if set any
 # STREAM events sent to the client (after it has subscribed to them)
-# will be restricted to those belonging to the client itself. This
-# option only works for local clients and will be unset for remote
-# clients.
+# will be restricted to those belonging to the client itself.
 
 import argparse
 import fcntl
@@ -141,6 +140,7 @@ import textwrap
 import time
 import yaml
 
+DEFAULT_PROFILE_DIR = ['/etc/onion-grater.d/']
 DEFAULT_LISTEN_ADDRESS = 'localhost'
 DEFAULT_LISTEN_PORT = 9051
 DEFAULT_COOKIE_PATH = '/run/tor/control.authcookie'
@@ -196,6 +196,43 @@ def get_ip_address(ifname):
         0x8915,  # SIOCGIFADDR
         struct.pack('256s', bytes(ifname[:15], 'utf-8'))
     )[20:24])
+
+
+def merge_yml(final_obj, parsing_obj):
+    # Inputs - 2 dictionaries/lists from YML/YAML file
+    # "parsing_obj" is parsed and merged into "final_obj" and returned back
+    if isinstance(final_obj,dict) and isinstance(parsing_obj,dict):
+        for k,v in parsing_obj.items():
+            if k not in final_obj:
+                final_obj[k] = v
+            else:
+                final_obj[k] = merge_yml(final_obj[k],v)
+    else:
+        # Non Dictionary case - LIST
+        pattern_final_obj = {}
+        # Only when the LIST are different
+        if(final_obj != parsing_obj):
+            # Specially handle GETINFO case which contains pattern and response
+            for ele in final_obj:
+                if(type(ele) is dict):
+                    if all (k in ele for k in ('pattern','response')):
+                        pattern_final_obj = ele
+
+            # If pattern is same, no need for this whole LIST
+            # We will use the higher priority pattern,response
+            for ele in parsing_obj:
+                if(type(ele) is dict):
+                    if all (k in ele for k in ('pattern','response')):
+                        if 'pattern' in pattern_final_obj:
+                            if pattern_final_obj['pattern'] == ele['pattern']:
+                                parsing_obj.remove(ele)
+
+            # Add without duplicates
+            # Commented because it always fails
+            # TypeError: can only concatenate str (not "list") to str
+            #final_obj += [ele for ele in parsing_obj if ele not in final_obj]
+            final_obj += parsing_obj
+    return final_obj
 
 
 class FilteredControlPortProxySession:
@@ -315,6 +352,8 @@ class FilteredControlPortProxySession:
                             for line in split_lines]) + "\r\n"
 
     def event_cb(self, event, event_rewriter=None):
+        client_host = self.client_address[0]
+        pid_based_connection = ipaddress.ip_address(client_host).is_loopback
         if self.restrict_stream_events and \
            isinstance(event, stem.response.events.StreamEvent) and \
            not global_args.disable_filtering:
@@ -322,9 +361,10 @@ class FilteredControlPortProxySession:
                 if event.status not in [stem.StreamStatus.NEW,
                                         stem.StreamStatus.NEWRESOLVE]:
                     return
-                if self.client_address == event.source_address or \
+                if (client_host == event.source_address) or \
+                   (pid_based_connection and
                    self.client_pid == pid_of_laddr((event.source_address,
-                                                    event.source_port)):
+                                                    event.source_port))):
                     self.client_streams.add(event.id)
                 else:
                     return
@@ -549,7 +589,11 @@ class FilteredControlPortProxyHandler(socketserver.StreamRequestHandler):
         self.restrict_stream_events = False
         self.server_address = self.server.server_address
         self.subscribed_event_listeners = []
-        for filter_file in glob.glob('/etc/onion-grater.d/*.yml'):
+        profile_dir = []
+        for directory in global_args.profile_dir:
+            profile_dir += glob.glob(directory + '*.yml')
+        profile_dir.sort(reverse = True)
+        for filter_file in profile_dir:
             try:
                 with open(filter_file, "rb") as fh:
                     filters = yaml.safe_load(fh.read())
@@ -561,6 +605,9 @@ class FilteredControlPortProxyHandler(socketserver.StreamRequestHandler):
             except (yaml.parser.ParserError, yaml.scanner.ScannerError) as err:
                 log("filter '{}' has bad YAML and was not loaded: {}"
                     .format(filter_file, str(err)))
+
+    def case_insensitive_regex(self, s):
+        return ''.join(['[' + c.upper() + c.lower() + ']' for c in s])
 
     def add_allowed_commands(self, commands):
         for cmd in commands:
@@ -574,9 +621,6 @@ class FilteredControlPortProxyHandler(socketserver.StreamRequestHandler):
                 if isinstance(allowed_args[i], str):
                     allowed_args[i] = {'pattern': allowed_args[i]}
             self.allowed_commands[cmd.upper()] = allowed_args
-
-    def case_insensitive_regex(self, s):
-        return ''.join(['[' + c.upper() + c.lower() + ']' for c in s])
 
     def add_allowed_confs_commands(self, confs):
         combined_getconf_rule = {'pattern': "(" + "|".join([
@@ -619,20 +663,34 @@ class FilteredControlPortProxyHandler(socketserver.StreamRequestHandler):
                            if all(any(val == expected_val or val == '*'
                                       for val in filter_.get(key, []))
                                   for key, expected_val in matchers)]
+
+        log("-" * 50)
         if len(matched_filters) == 0:
             return
-        elif len(matched_filters) > 1:
-            raise RuntimeError('multiple filters matched: ' +
-                               ', '.join(matched_filters))
-        matched_filter = matched_filters[0]
-        self.filter_name = matched_filter['name']
-        commands = matched_filter.get('commands', {}) or {}
+        if len(matched_filters) == 1:
+            final_filter = matched_filters[0]
+        else:
+            if global_args.multiple_matches:
+                file_names = ''
+                merged_filter = {}
+                for single_filter in matched_filters:
+                    file_names += ' ' + single_filter.get('name')
+                    merged_filter = merge_yml(merged_filter, single_filter)
+                final_filter = [merged_filter,]
+                final_filter = final_filter[0]
+                final_filter['name'] = "merged:" + file_names
+            else:
+                raise RuntimeError('multiple filters matched: {}'
+                                   .format(matched_filters))
+
+        self.filter_name = final_filter['name']
+        commands = final_filter.get('commands', {}) or {}
         self.add_allowed_commands(commands)
-        confs = matched_filter.get('confs', {}) or {}
+        confs = final_filter.get('confs', {}) or {}
         self.add_allowed_confs_commands(confs)
-        events = matched_filter.get('events', {}) or {}
+        events = final_filter.get('events', {}) or {}
         self.add_allowed_events(events)
-        self.restrict_stream_events = bool(matched_filter.get(
+        self.restrict_stream_events = bool(final_filter.get(
             'restrict-stream-events', False
         ))
 
@@ -704,21 +762,12 @@ class FilteredControlPortProxyHandler(socketserver.StreamRequestHandler):
             self.client_desc = '{1}:{2} (filter: {0})'.format(
                 self.filter_name, *self.client_address
             )
-        remote_connection = not pid_based_connection and ipaddress.ip_address(
-            client_host
-        ) not in ipaddress.ip_network(LOCAL_VETH_NETWORK)
-        if self.restrict_stream_events and remote_connection:
-            self.debug_log(
-                "filter '{}' has `restrict-stream-events` set "
-                "and we are remote so the option was disabled"
-                .format(self.filter_name)
-            )
-            self.restrict_stream_events = False
 
         if len(self.filters) == 0:
             status = 'no matching filter found, using an empty one'
         else:
             status = 'loaded filter: {}'.format(self.filter_name)
+        log('{} matched: {}'.format(self.client_desc, matchers[0]))
         log('{} connected: {}'.format(self.client_desc, status))
         if global_args.debug:
             log('Final rules:')
@@ -757,6 +806,17 @@ class FilteredControlPortProxy(socketserver.ThreadingTCPServer):
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--multiple-matches",
+        action='store_true', default=False,
+        help="allow multiple files to match "
+    )
+    parser.add_argument(
+        "--profile-dir",
+        action='append', metavar='DIR',
+        help="specifies the directory on which the profiles are " +
+             "(default: {})".format(DEFAULT_PROFILE_DIR)
+    )
     parser.add_argument(
         "--listen-address",
         type=str, metavar='ADDR', default=DEFAULT_LISTEN_ADDRESS,
@@ -805,13 +865,24 @@ def main():
     if global_args.listen_interface:
         ip_address = get_ip_address(global_args.listen_interface)
         if global_args.debug:
-            log("IP address for interface {} : {}".format(
+            log("IP address for interface {}: {}".format(
                 global_args.listen_interface, ip_address))
     else:
         ip_address = global_args.listen_address
     address = (ip_address, global_args.listen_port)
     server = FilteredControlPortProxy(address, FilteredControlPortProxyHandler)
     log("Tor control port filter started, listening on {}:{}".format(*address))
+    profile_dir = []
+    # https://bugs.python.org/issue16399
+    if global_args.profile_dir == None:
+        global_args.profile_dir = DEFAULT_PROFILE_DIR
+    for dir in global_args.profile_dir:
+        # Don't duplicate directories
+        if dir not in profile_dir:
+            # Adds trailing slash at the end of dir if it doesn't exist yet
+            profile_dir.append(os.path.join(dir, ''))
+    global_args.profile_dir = profile_dir
+    log("Profile directory: {}".format(profile_dir))
     try:
         server.serve_forever()
     except KeyboardInterrupt:
